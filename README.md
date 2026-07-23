@@ -36,7 +36,7 @@ Everything. Full CRUD on every entity type:
 | "Who sends me the most documents?" | Lists correspondents by document count |
 | "Set up a storage path for legal documents" | Creates organized folder structure |
 
-**43 tools** covering:
+**45 tools** covering:
 - **Documents** — search, upload, download, update, delete, bulk operations, OCR reprocessing
 - **Tags** — full CRUD with colors, matching rules, and hierarchical parents
 - **Correspondents** — track who sends you stuff
@@ -221,7 +221,7 @@ Requires [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
 ## The Full Toolbox
 
-43 tools, organized by what they touch. Every entity supports full CRUD.
+45 tools, organized by what they touch. Every entity supports full CRUD.
 
 <details>
 <summary><strong>Documents</strong> — the main event</summary>
@@ -238,6 +238,8 @@ Requires [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 | `paperless_documents_download` | Get download URL for original file |
 | `paperless_documents_preview` | Get preview URL |
 | `paperless_documents_thumbnail` | Get thumbnail URL |
+| `paperless_documents_download_content` | Get authenticated original bytes as bounded base64 |
+| `paperless_documents_preview_content` | Get authenticated preview bytes as bounded base64 |
 | `paperless_documents_reprocess` | Re-run OCR on a document |
 
 </details>
@@ -336,8 +338,45 @@ Environment variables. That's it. No config files to manage.
 | `MCP_RELAX_ACCEPT_HEADER` | | `false` | Normalize `/mcp` POST `Accept` headers for clients that cannot send both Streamable HTTP media types |
 | `MAX_PAGE_SIZE` | | `100` | Upper bound for paginated Paperless-ngx requests made by this server |
 | `HTTP_TIMEOUT_SECONDS` | | `30` | Timeout for requests to Paperless-ngx. Raise it if large full-text searches time out |
+| `MAX_DOWNLOAD_SIZE_BYTES` | | `10485760` | Maximum decoded size returned by the base64 document content tools |
 
 Aliases supported: `PAPERLESS_URL` and `PAPERLESS_TOKEN` also work if that's your style.
+
+### Binary document content
+
+The existing `paperless_documents_download`,
+`paperless_documents_preview`, and `paperless_documents_thumbnail` tools keep
+returning URLs. The additional `*_content` tools perform an authenticated GET
+through the existing `PaperlessClient` and return `data` (base64),
+`mime_type`, `filename`, and `size`.
+
+The API token remains in `PaperlessAuthHandler`; it is never serialized or
+included in a URL. Content is rejected when the ID is invalid, the MIME type is
+not supported, or the decoded byte size exceeds
+`MAX_DOWNLOAD_SIZE_BYTES`. Errors distinguish `NOT_FOUND`,
+`UPSTREAM_ERROR`, `DOCUMENT_TOO_LARGE`, `TIMEOUT`, and
+`UNSUPPORTED_CONTENT_TYPE`.
+Invalid values, or values above the hard 100 MiB safety ceiling, fall back to
+the 10 MiB default.
+
+### Build a custom content-tool image
+
+From the repository root:
+
+```bash
+docker build \
+  --build-arg VERSION=0.3.2-content \
+  -t paperlessmcp-content:0.3.2-content \
+  -f PaperlessMCP/Dockerfile \
+  PaperlessMCP
+```
+
+To publish it to a registry reachable by QNAP:
+
+```bash
+docker tag paperlessmcp-content:0.3.2-content registry.example/paperlessmcp-content:0.3.2-content
+docker push registry.example/paperlessmcp-content:0.3.2-content
+```
 
 ### LocalAI Compatibility
 

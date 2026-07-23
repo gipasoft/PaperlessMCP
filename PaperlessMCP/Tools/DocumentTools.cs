@@ -203,6 +203,62 @@ public static class DocumentTools
         return JsonSerializer.Serialize(response);
     }
 
+    [McpServerTool(Name = "paperless_documents_download_content")]
+    [Description("Download a document's original file as validated base64 content. The response is limited by MAX_DOWNLOAD_SIZE_BYTES.")]
+    public static Task<string> DownloadContent(
+        PaperlessClient client,
+        [Description("Positive document ID")] int id) =>
+        GetContent(client, id, DocumentContentVariant.Download);
+
+    [McpServerTool(Name = "paperless_documents_preview_content")]
+    [Description("Download a document preview as validated base64 content. The response is limited by MAX_DOWNLOAD_SIZE_BYTES.")]
+    public static Task<string> PreviewContent(
+        PaperlessClient client,
+        [Description("Positive document ID")] int id) =>
+        GetContent(client, id, DocumentContentVariant.Preview);
+
+    private static async Task<string> GetContent(
+        PaperlessClient client,
+        int id,
+        DocumentContentVariant variant)
+    {
+        var result = await client
+            .GetDocumentContentAsync(id, variant)
+            .ConfigureAwait(false);
+        var meta = new McpMeta { PaperlessBaseUrl = client.BaseUrl };
+
+        if (!result.IsSuccess)
+        {
+            var code = ContentErrorCode(result.ErrorKind);
+            return JsonSerializer.Serialize(McpErrorResponse.Create(
+                code,
+                result.ErrorMessage ?? "Failed to retrieve document content",
+                meta: meta));
+        }
+
+        var content = result.Content!;
+        return JsonSerializer.Serialize(McpResponse<DocumentContentToolPayload>.Success(
+            new DocumentContentToolPayload
+            {
+                Data = Convert.ToBase64String(content.Data),
+                MimeType = content.MimeType,
+                FileName = content.FileName,
+                Size = content.Size
+            },
+            meta));
+    }
+
+    internal static string ContentErrorCode(DocumentContentErrorKind? kind) =>
+        kind switch
+        {
+            DocumentContentErrorKind.Validation => ErrorCodes.Validation,
+            DocumentContentErrorKind.NotFound => ErrorCodes.NotFound,
+            DocumentContentErrorKind.DocumentTooLarge => ErrorCodes.DocumentTooLarge,
+            DocumentContentErrorKind.Timeout => ErrorCodes.Timeout,
+            DocumentContentErrorKind.UnsupportedContentType => ErrorCodes.UnsupportedContentType,
+            _ => ErrorCodes.UpstreamError
+        };
+
     [McpServerTool(Name = "paperless_documents_upload")]
     [Description("Upload a new document to Paperless-ngx. Provide file content as base64. For large files, use paperless_documents_upload_from_path instead.")]
     public static async Task<string> Upload(

@@ -114,4 +114,7 @@ public static class ErrorCodes
     public const string RateLimit = "RATE_LIMIT";
     public const string Unknown = "UNKNOWN";
     public const string ConfirmationRequired = "CONFIRMATION_REQUIRED";
+    public const string DocumentTooLarge = "DOCUMENT_TOO_LARGE";
+    public const string Timeout = "TIMEOUT";
+    public const string UnsupportedContentType = "UNSUPPORTED_CONTENT_TYPE";
 }

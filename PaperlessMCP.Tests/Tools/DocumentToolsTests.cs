@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using FluentAssertions;
 using PaperlessMCP.Tests.Fixtures;
+using PaperlessMCP.Models.Documents;
 using RichardSzalay.MockHttp;
 using PaperlessMCP.Tools;
 using Xunit;
@@ -383,6 +384,112 @@ public class DocumentToolsTests : IDisposable
         json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
         json.RootElement.GetProperty("result").GetProperty("thumbnail_url").GetString()
             .Should().Contain("/api/documents/1/thumb/");
+    }
+
+    [Fact]
+    public async Task DownloadContent_WhenSuccessful_ReturnsBase64ContentEnvelope()
+    {
+        var bytes = "document bytes"u8.ToArray();
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/1/download/")
+            .Respond("application/pdf", "document bytes");
+
+        var result = await DocumentTools.DownloadContent(_factory.Client, 1);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        var payload = json.RootElement.GetProperty("result");
+        payload.GetProperty("data").GetString().Should().Be(Convert.ToBase64String(bytes));
+        payload.GetProperty("mime_type").GetString().Should().Be("application/pdf");
+        payload.GetProperty("filename").GetString().Should().Be("document-1.pdf");
+        payload.GetProperty("size").GetInt64().Should().Be(bytes.Length);
+        result.Should().NotContain("test-token");
+        result.Should().NotContain("token=");
+    }
+
+    [Fact]
+    public async Task PreviewContent_WhenSuccessful_ReturnsBase64ContentEnvelope()
+    {
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/2/preview/")
+            .Respond("application/pdf", "preview");
+
+        var result = await DocumentTools.PreviewContent(_factory.Client, 2);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("result").GetProperty("filename").GetString()
+            .Should().Be("document-2-preview.pdf");
+    }
+
+    [Fact]
+    public async Task ContentTools_RejectInvalidDocumentIds()
+    {
+        var result = await DocumentTools.DownloadContent(_factory.Client, 0);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString()
+            .Should().Be("VALIDATION");
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound, "NOT_FOUND")]
+    [InlineData(HttpStatusCode.BadGateway, "UPSTREAM_ERROR")]
+    public async Task DownloadContent_ReturnsDistinctUpstreamErrors(
+        HttpStatusCode status,
+        string expectedCode)
+    {
+        _factory.SetupGetWithStatus("api/documents/3/download/", status);
+
+        var result = await DocumentTools.DownloadContent(_factory.Client, 3);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("error").GetProperty("code").GetString()
+            .Should().Be(expectedCode);
+    }
+
+    [Fact]
+    public async Task DownloadContent_ReturnsDocumentTooLarge()
+    {
+        _factory.Options.MaxDownloadSizeBytes = 3;
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/3/download/")
+            .Respond("application/pdf", "four");
+
+        var result = await DocumentTools.DownloadContent(_factory.Client, 3);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("error").GetProperty("code").GetString()
+            .Should().Be("DOCUMENT_TOO_LARGE");
+    }
+
+    [Fact]
+    public async Task DownloadContent_ReturnsUnsupportedContentType()
+    {
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/3/download/")
+            .Respond("text/html", "unsafe");
+
+        var result = await DocumentTools.DownloadContent(_factory.Client, 3);
+
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("error").GetProperty("code").GetString()
+            .Should().Be("UNSUPPORTED_CONTENT_TYPE");
+    }
+
+    [Theory]
+    [InlineData(DocumentContentErrorKind.Validation, "VALIDATION")]
+    [InlineData(DocumentContentErrorKind.NotFound, "NOT_FOUND")]
+    [InlineData(DocumentContentErrorKind.UpstreamError, "UPSTREAM_ERROR")]
+    [InlineData(DocumentContentErrorKind.DocumentTooLarge, "DOCUMENT_TOO_LARGE")]
+    [InlineData(DocumentContentErrorKind.Timeout, "TIMEOUT")]
+    [InlineData(DocumentContentErrorKind.UnsupportedContentType, "UNSUPPORTED_CONTENT_TYPE")]
+    public void ContentErrorCode_MapsEveryDistinctFailure(
+        DocumentContentErrorKind kind,
+        string expectedCode)
+    {
+        DocumentTools.ContentErrorCode(kind).Should().Be(expectedCode);
     }
 
     #endregion

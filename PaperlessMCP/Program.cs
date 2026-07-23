@@ -111,6 +111,15 @@ void ConfigureServices(IServiceCollection services, IConfiguration configuration
         options.HttpTimeoutSeconds = ParsingHelpers.ParsePositiveInt(
             Environment.GetEnvironmentVariable("HTTP_TIMEOUT_SECONDS"),
             configuration.GetValue<int?>("Paperless:HttpTimeoutSeconds") ?? 30);
+
+        var rawMaxDownloadSize = Environment.GetEnvironmentVariable("MAX_DOWNLOAD_SIZE_BYTES")
+                                 ?? configuration.GetValue<string>("Paperless:MaxDownloadSizeBytes");
+        options.MaxDownloadSizeBytes =
+            long.TryParse(rawMaxDownloadSize, out var maxDownloadSize) &&
+            maxDownloadSize > 0 &&
+            maxDownloadSize <= PaperlessOptions.MaximumDownloadSizeBytes
+                ? maxDownloadSize
+                : PaperlessOptions.DefaultMaxDownloadSizeBytes;
     });
 
     // Configure retry policy for transient errors

@@ -90,6 +90,34 @@ Get the thumbnail URL for a document.
 
 **Returns:** Thumbnail URL
 
+### `paperless_documents_download_content`
+Download the original document through the authenticated Paperless client.
+The existing URL-based download tool is unchanged.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | int | Yes | Positive document ID |
+
+**Returns:** `{ "data": "<base64>", "mime_type": "...", "filename": "...", "size": 123 }`
+
+The decoded payload cannot exceed `MAX_DOWNLOAD_SIZE_BYTES` (default:
+10 MiB). Errors use distinct codes: `VALIDATION`, `NOT_FOUND`,
+`UPSTREAM_ERROR`, `DOCUMENT_TOO_LARGE`, `TIMEOUT`, and
+`UNSUPPORTED_CONTENT_TYPE`.
+
+### `paperless_documents_preview_content`
+Download the Paperless-generated preview through the authenticated Paperless
+client. The existing URL-based preview tool is unchanged.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | int | Yes | Positive document ID |
+
+**Returns:** `{ "data": "<base64>", "mime_type": "...", "filename": "...", "size": 123 }`
+
+The same MIME validation, size limit, timeout handling, and error codes as
+`paperless_documents_download_content` apply.
+
 ### `paperless.documents.upload`
 Upload a new document to Paperless-ngx via base64-encoded content.
 

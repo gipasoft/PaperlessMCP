@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Web;
@@ -30,6 +31,28 @@ public class PaperlessClient
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
+
+    private static readonly HashSet<string> SupportedDocumentContentTypes =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "application/pdf",
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/tiff",
+            "image/webp",
+            "message/rfc822",
+            "text/plain",
+            "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.oasis.opendocument.presentation",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "application/vnd.oasis.opendocument.text",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        };
 
     public PaperlessClient(HttpClient httpClient, IOptions<PaperlessOptions> options, ILogger<PaperlessClient> logger)
     {
@@ -224,6 +247,169 @@ public class PaperlessClient
     public async Task<Document?> GetDocumentAsync(int id, CancellationToken cancellationToken = default)
     {
         return await GetAsync<Document>($"api/documents/{id}/", cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Downloads a document original or preview through the authenticated
+    /// Paperless HttpClient while enforcing MIME and size limits.
+    /// </summary>
+    public async Task<DocumentContentResult> GetDocumentContentAsync(
+        int id,
+        DocumentContentVariant variant,
+        CancellationToken cancellationToken = default)
+    {
+        if (id <= 0)
+        {
+            return DocumentContentResult.Failure(
+                DocumentContentErrorKind.Validation,
+                "Document ID must be a positive integer");
+        }
+
+        var endpoint = variant == DocumentContentVariant.Preview
+            ? $"api/documents/{id}/preview/"
+            : $"api/documents/{id}/download/";
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+            using var response = await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                return DocumentContentResult.Failure(
+                    DocumentContentErrorKind.NotFound,
+                    $"Document with ID {id} not found");
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                return DocumentContentResult.Failure(
+                    DocumentContentErrorKind.UpstreamError,
+                    $"Paperless returned HTTP {(int)response.StatusCode}");
+            }
+
+            var mimeType = response.Content.Headers.ContentType?.MediaType;
+            if (mimeType == null || !SupportedDocumentContentTypes.Contains(mimeType))
+            {
+                return DocumentContentResult.Failure(
+                    DocumentContentErrorKind.UnsupportedContentType,
+                    "Paperless returned an unsupported content type");
+            }
+
+            var maxBytes = _options.MaxDownloadSizeBytes > 0
+                ? _options.MaxDownloadSizeBytes
+                : PaperlessOptions.DefaultMaxDownloadSizeBytes;
+            if (response.Content.Headers.ContentLength is long contentLength &&
+                contentLength > maxBytes)
+            {
+                return DocumentContentResult.Failure(
+                    DocumentContentErrorKind.DocumentTooLarge,
+                    $"Document exceeds the configured {maxBytes}-byte limit");
+            }
+
+            await using var source = await response.Content
+                .ReadAsStreamAsync(cancellationToken)
+                .ConfigureAwait(false);
+            await using var target = new MemoryStream();
+            var buffer = new byte[81920];
+            long total = 0;
+            while (true)
+            {
+                var read = await source
+                    .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0) break;
+                total += read;
+                if (total > maxBytes)
+                {
+                    return DocumentContentResult.Failure(
+                        DocumentContentErrorKind.DocumentTooLarge,
+                        $"Document exceeds the configured {maxBytes}-byte limit");
+                }
+                await target
+                    .WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var fileName = SafeContentFileName(
+                response.Content.Headers.ContentDisposition,
+                id,
+                variant,
+                mimeType);
+            return DocumentContentResult.Success(
+                new DocumentContentPayload(
+                    target.ToArray(),
+                    mimeType.ToLowerInvariant(),
+                    fileName,
+                    total));
+        }
+        catch (OperationCanceledException)
+        {
+            return DocumentContentResult.Failure(
+                DocumentContentErrorKind.Timeout,
+                "Paperless document request timed out");
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Document content request failed: {Endpoint}", endpoint);
+            return DocumentContentResult.Failure(
+                DocumentContentErrorKind.UpstreamError,
+                "Paperless document request failed");
+        }
+        catch (IOException ex)
+        {
+            _logger.LogError(ex, "Document content stream failed: {Endpoint}", endpoint);
+            return DocumentContentResult.Failure(
+                DocumentContentErrorKind.UpstreamError,
+                "Paperless document stream failed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected document content failure: {Endpoint}", endpoint);
+            return DocumentContentResult.Failure(
+                DocumentContentErrorKind.UpstreamError,
+                "Paperless document request failed");
+        }
+    }
+
+    private static string SafeContentFileName(
+        ContentDispositionHeaderValue? disposition,
+        int id,
+        DocumentContentVariant variant,
+        string mimeType)
+    {
+        var raw = disposition?.FileNameStar ?? disposition?.FileName;
+        var candidate = raw?.Trim().Trim('"');
+        if (!string.IsNullOrWhiteSpace(candidate))
+        {
+            candidate = Path.GetFileName(candidate);
+            candidate = new string(candidate
+                .Where(character =>
+                    !char.IsControl(character) &&
+                    character != '/' &&
+                    character != '\\')
+                .Take(180)
+                .ToArray())
+                .Trim();
+            if (candidate.Length > 0) return candidate;
+        }
+
+        var suffix = variant == DocumentContentVariant.Preview ? "-preview" : "";
+        var extension = mimeType.ToLowerInvariant() switch
+        {
+            "application/pdf" => ".pdf",
+            "image/gif" => ".gif",
+            "image/jpeg" => ".jpg",
+            "image/png" => ".png",
+            "image/tiff" => ".tiff",
+            "image/webp" => ".webp",
+            "message/rfc822" => ".eml",
+            "text/plain" => ".txt",
+            _ => ""
+        };
+        return $"document-{id}{suffix}{extension}";
     }
 
     /// <summary>

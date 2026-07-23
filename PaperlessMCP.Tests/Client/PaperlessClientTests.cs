@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using FluentAssertions;
 using PaperlessMCP.Client;
 using PaperlessMCP.Models.Correspondents;
@@ -62,6 +63,148 @@ public class PaperlessClientTests : IDisposable
     #endregion
 
     #region Document Tests
+
+    [Fact]
+    public async Task GetDocumentContentAsync_Download_ReturnsValidatedBytesAndMetadata()
+    {
+        var bytes = "pdf-content"u8.ToArray();
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/7/download/")
+            .Respond(_ =>
+            {
+                var content = new ByteArrayContent(bytes);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+                content.Headers.ContentDisposition = new ContentDispositionHeaderValue("attachment")
+                {
+                    FileNameStar = "fattura TIM.pdf"
+                };
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+            });
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Content.Should().NotBeNull();
+        result.Content!.Data.Should().Equal(bytes);
+        result.Content.MimeType.Should().Be("application/pdf");
+        result.Content.FileName.Should().Be("fattura TIM.pdf");
+        result.Content.Size.Should().Be(bytes.Length);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_Preview_UsesThePreviewEndpoint()
+    {
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/8/preview/")
+            .Respond("application/pdf", "preview");
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            8,
+            DocumentContentVariant.Preview);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Content!.FileName.Should().Be("document-8-preview.pdf");
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_RejectsInvalidIdsWithoutAnUpstreamCall()
+    {
+        var result = await _factory.Client.GetDocumentContentAsync(
+            0,
+            DocumentContentVariant.Download);
+
+        result.IsSuccess.Should().BeFalse();
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.Validation);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_MapsNotFound()
+    {
+        _factory.SetupGetWithStatus("api/documents/404/download/", HttpStatusCode.NotFound);
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            404,
+            DocumentContentVariant.Download);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.NotFound);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_MapsUpstreamErrors()
+    {
+        _factory.SetupGetWithStatus(
+            "api/documents/7/download/",
+            HttpStatusCode.BadGateway);
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.UpstreamError);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_RejectsUnsupportedContentTypes()
+    {
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/7/download/")
+            .Respond("text/html", "<script>unsafe</script>");
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.UnsupportedContentType);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_RejectsContentLengthOverTheConfiguredLimit()
+    {
+        _factory.Options.MaxDownloadSizeBytes = 3;
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/7/download/")
+            .Respond("application/pdf", "four");
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.DocumentTooLarge);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_EnforcesTheLimitWhileStreamingWithoutContentLength()
+    {
+        _factory.Options.MaxDownloadSizeBytes = 3;
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/7/download/")
+            .Respond(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new UnknownLengthContent("four"u8.ToArray(), "application/pdf")
+            });
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.DocumentTooLarge);
+    }
+
+    [Fact]
+    public async Task GetDocumentContentAsync_MapsCancellationToTimeout()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var result = await _factory.Client.GetDocumentContentAsync(
+            7,
+            DocumentContentVariant.Download,
+            cancellation.Token);
+
+        result.ErrorKind.Should().Be(DocumentContentErrorKind.Timeout);
+    }
 
     [Fact]
     public async Task SearchDocumentsAsync_WithQuery_ReturnsResults()
@@ -221,6 +364,28 @@ public class PaperlessClientTests : IDisposable
     }
 
     #endregion
+
+    private sealed class UnknownLengthContent : HttpContent
+    {
+        private readonly byte[] _bytes;
+
+        public UnknownLengthContent(byte[] bytes, string mediaType)
+        {
+            _bytes = bytes;
+            Headers.ContentType = new MediaTypeHeaderValue(mediaType);
+        }
+
+        protected override Task SerializeToStreamAsync(
+            Stream stream,
+            TransportContext? context) =>
+            stream.WriteAsync(_bytes).AsTask();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
 
     #region Tag Tests
 
