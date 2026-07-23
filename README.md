@@ -378,6 +378,27 @@ docker tag paperlessmcp-content:0.3.2-content registry.example/paperlessmcp-cont
 docker push registry.example/paperlessmcp-content:0.3.2-content
 ```
 
+### Fork image on GHCR
+
+This fork publishes a `linux/amd64` image after every successful push to
+`main`:
+
+```text
+ghcr.io/gipasoft/paperlessmcp:latest
+```
+
+The package must be made public once after its first publication. QNAP updates
+then require no local build and no registry login:
+
+```bash
+docker compose pull paperless-mcp
+docker compose up -d paperless-mcp
+docker compose ps
+docker compose logs --tail=100 paperless-mcp
+```
+
+Set `PAPERLESS_MCP_IMAGE` to an immutable `sha-<short-commit>` tag to roll back.
+
 ### LocalAI Compatibility
 
 Streamable HTTP clients are expected to send `Accept: application/json, text/event-stream` on `/mcp` POST requests. Some clients cannot configure that header. Set `MCP_RELAX_ACCEPT_HEADER=true` to have PaperlessMCP normalize missing or incomplete `Accept` headers before the MCP SDK handles the request.
