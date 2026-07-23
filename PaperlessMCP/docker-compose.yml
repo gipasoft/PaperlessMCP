@@ -1,11 +1,7 @@
-version: '3.8'
-
 services:
   paperless-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ${PAPERLESS_MCP_IMAGE:-paperlessmcp-content:0.3.2-content}
+    image: ${PAPERLESS_MCP_IMAGE:-ghcr.io/gipasoft/paperlessmcp:latest}
+    pull_policy: always
     container_name: paperless-mcp
     ports:
       - "5000:5000"
