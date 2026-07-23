@@ -54,6 +54,41 @@ public class GhcrPublishingTests
         Assert.DoesNotContain("    build:", compose);
     }
 
+    [Fact]
+    public void UpstreamSync_IsWeeklyManualAndPullRequestOnly()
+    {
+        var workflowPath = Path.Combine(
+            RepositoryRoot, ".github", "workflows", "upstream-sync.yml");
+
+        Assert.True(File.Exists(workflowPath), $"Missing workflow: {workflowPath}");
+
+        var workflow = File.ReadAllText(workflowPath);
+
+        Assert.Contains("cron: \"0 5 * * 1\"", workflow);
+        Assert.Contains("workflow_dispatch:", workflow);
+        Assert.Contains("https://github.com/barryw/PaperlessMCP.git", workflow);
+        Assert.Contains("automation/sync-upstream-", workflow);
+        Assert.Contains("dotnet test PaperlessMCP.sln --no-restore", workflow);
+        Assert.Contains("gh pr create", workflow);
+        Assert.DoesNotContain("--force", workflow);
+        Assert.DoesNotContain("HEAD:main", workflow);
+        Assert.DoesNotContain("push origin main", workflow);
+    }
+
+    [Fact]
+    public void DockerWorkflow_ValidatesPullRequestsWithoutPublishing()
+    {
+        var workflowPath = Path.Combine(
+            RepositoryRoot, ".github", "workflows", "docker-publish.yml");
+        var workflow = File.ReadAllText(workflowPath);
+
+        Assert.Contains("pull_request:", workflow);
+        Assert.Contains("if: github.event_name != 'pull_request'", workflow);
+        Assert.Contains(
+            "push: ${{ github.event_name != 'pull_request' }}",
+            workflow);
+    }
+
     private static string FindRepositoryRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
