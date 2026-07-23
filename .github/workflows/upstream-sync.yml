@@ -1,0 +1,101 @@
+name: Check upstream updates
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/barryw/PaperlessMCP.git
+          git fetch upstream main
+      - name: Check for updates
+        id: updates
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream/main." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select synchronization branch
+        if: steps.updates.outputs.available == 'true'
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          existing="$(gh pr list --state open --base main --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("automation/sync-upstream-"))][0].headRefName // ""')"
+          if [[ -n "$existing" ]]; then
+            git fetch origin "$existing"
+            git checkout -B "$existing" "origin/$existing"
+            branch="$existing"
+          else
+            branch="automation/sync-upstream-$(git rev-parse --short=7 upstream/main)"
+            git checkout -b "$branch" origin/main
+          fi
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+      - name: Merge fork main and upstream
+        if: steps.updates.outputs.available == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-edit origin/main; then
+            git merge --abort || true
+            echo "Merge conflict with fork main." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort || true
+            echo "Merge conflict with upstream/main; resolve manually." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Restore
+        if: steps.updates.outputs.available == 'true'
+        run: dotnet restore PaperlessMCP.sln
+      - name: Test
+        if: steps.updates.outputs.available == 'true'
+        run: dotnet test PaperlessMCP.sln --configuration Release --no-restore
+      - name: Push synchronization branch
+        if: steps.updates.outputs.available == 'true'
+        run: git push origin "HEAD:${{ steps.branch.outputs.name }}"
+      - name: Open pull request
+        if: steps.updates.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        shell: bash
+        run: |
+          count="$(gh pr list --state open --head "$BRANCH" --json number --jq 'length')"
+          if [[ "$count" == "0" ]]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync upstream PaperlessMCP" \
+              --body "Automated weekly merge of barryw/PaperlessMCP:main. Review and merge manually; merging triggers the GHCR publisher."
+          else
+            echo "Updated existing PR for $BRANCH." >> "$GITHUB_STEP_SUMMARY"
+          fi

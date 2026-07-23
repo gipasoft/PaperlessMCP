@@ -68,7 +68,9 @@ public class GhcrPublishingTests
         Assert.Contains("workflow_dispatch:", workflow);
         Assert.Contains("https://github.com/barryw/PaperlessMCP.git", workflow);
         Assert.Contains("automation/sync-upstream-", workflow);
-        Assert.Contains("dotnet test PaperlessMCP.sln --no-restore", workflow);
+        Assert.Contains(
+            "dotnet test PaperlessMCP.sln --configuration Release --no-restore",
+            workflow);
         Assert.Contains("gh pr create", workflow);
         Assert.DoesNotContain("--force", workflow);
         Assert.DoesNotContain("HEAD:main", workflow);
