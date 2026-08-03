@@ -86,6 +86,27 @@ public class DocumentToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task Search_WithCustomFieldQuery_ForwardsQueryToPaperless()
+    {
+        // Arrange
+        _factory.MockHandler
+            .When(HttpMethod.Get, "https://paperless.example.com/api/documents/*")
+            .With(request => System.Web.HttpUtility.ParseQueryString(request.RequestUri!.Query)["custom_field_query"]
+                == """["Invoice Number","icontains","INV-2024"]""")
+            .Respond("application/json", TestFixtures.Documents.CreateSearchResultsJson(3));
+
+        // Act
+        var result = await DocumentTools.Search(
+            _factory.Client,
+            customFieldQuery: """["Invoice Number","icontains","INV-2024"]""");
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue("because response was {0}", result);
+        json.RootElement.GetProperty("result").GetArrayLength().Should().Be(3);
+    }
+
+    [Fact]
     public async Task Search_WithCorrespondentAndNoteUserObject_ReturnsDocuments()
     {
         // Arrange
@@ -490,6 +511,433 @@ public class DocumentToolsTests : IDisposable
         string expectedCode)
     {
         DocumentTools.ContentErrorCode(kind).Should().Be(expectedCode);
+    }
+
+    #endregion
+
+    #region Export / base64 Tests
+
+    private static readonly byte[] FakePdfBytes = "%PDF-1.4 fake body"u8.ToArray();
+
+    private void SetupDownloadBytes(int id, byte[] bytes, string mediaType = "application/pdf")
+        => SetupDownloadResponse($"{_factory.Options.BaseUrl}/api/documents/{id}/download/", bytes, mediaType);
+
+    private void SetupDownloadResponse(
+        string url,
+        byte[] bytes,
+        string mediaType = "application/pdf",
+        string? dispositionFileName = null,
+        bool sendContentLength = true)
+    {
+        _factory.MockHandler
+            .When(HttpMethod.Get, url)
+            .Respond(_ =>
+            {
+                var content = new ByteArrayContent(bytes);
+                content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(mediaType);
+                if (dispositionFileName != null)
+                {
+                    content.Headers.ContentDisposition =
+                        new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                        {
+                            FileName = dispositionFileName
+                        };
+                }
+
+                if (!sendContentLength)
+                {
+                    content.Headers.ContentLength = null;
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+            });
+    }
+
+    private static string NewOutboxDir() =>
+        Path.Combine(Path.GetTempPath(), "pmcp-outbox-" + Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public async Task ExportToOutbox_WhenDocumentExists_WritesFileAndReturnsPath()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), "pmcp-outbox-" + Guid.NewGuid().ToString("N"));
+        _factory.Options.OutboxDirectory = tempDir;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            var res = json.RootElement.GetProperty("result");
+            // original=false serves the archived PDF, so the export is named after the
+            // archived file, plus the document id so two documents whose file has the same
+            // name cannot overwrite each other.
+            res.GetProperty("filename").GetString().Should().Be("test_document_archived_1.pdf");
+            res.GetProperty("mime_type").GetString().Should().Be("application/pdf");
+            res.GetProperty("size_bytes").GetInt32().Should().Be(FakePdfBytes.Length);
+
+            var path = res.GetProperty("path").GetString();
+            path.Should().NotBeNull();
+            File.Exists(path).Should().BeTrue();
+            (await File.ReadAllBytesAsync(path!)).Should().Equal(FakePdfBytes);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_WhenDocumentNotFound_ReturnsNotFound()
+    {
+        // Arrange
+        _factory.SetupGetWithStatus("api/documents/999/", HttpStatusCode.NotFound);
+
+        // Act
+        var result = await DocumentTools.ExportToOutbox(_factory.Client, 999);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("NOT_FOUND");
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_WithTraversalFilename_StaysInsideOutbox()
+    {
+        // Arrange
+        var tempDir = Path.Combine(Path.GetTempPath(), "pmcp-outbox-" + Guid.NewGuid().ToString("N"));
+        _factory.Options.OutboxDirectory = tempDir;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1, filename: "../../evil.pdf");
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            var res = json.RootElement.GetProperty("result");
+            res.GetProperty("filename").GetString().Should().Be("evil.pdf");
+            var path = res.GetProperty("path").GetString()!;
+            Path.GetDirectoryName(Path.GetFullPath(path)).Should().Be(Path.GetFullPath(tempDir));
+            File.Exists(path).Should().BeTrue();
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_WhenArchivedFileIsServed_DoesNotNameItAfterTheOriginal()
+    {
+        // Arrange: a scan with no archived file name of its own. original=false still serves the
+        // archived PDF, so naming the export page.jpg would hand the next tool a file whose
+        // extension lies about its content.
+        var tempDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        var document = TestFixtures.Documents.CreateDocument(1, "Scan") with
+        {
+            OriginalFileName = "page.jpg",
+            ArchivedFileName = null
+        };
+        _factory.SetupGet("api/documents/1/", JsonSerializer.Serialize(document));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            json.RootElement.GetProperty("result").GetProperty("filename").GetString()
+                .Should().Be("page_1.pdf");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_WhenOriginalRequested_KeepsTheOriginalExtension()
+    {
+        // Arrange
+        var tempDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        var document = TestFixtures.Documents.CreateDocument(1, "Scan") with
+        {
+            OriginalFileName = "page.jpg",
+            ArchivedFileName = null
+        };
+        _factory.SetupGet("api/documents/1/", JsonSerializer.Serialize(document));
+        SetupDownloadResponse(
+            $"{_factory.Options.BaseUrl}/api/documents/1/download/?original=true",
+            FakePdfBytes,
+            mediaType: "image/jpeg");
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1, original: true);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            json.RootElement.GetProperty("result").GetProperty("filename").GetString()
+                .Should().Be("page_1.jpg");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_PrefersTheFileNameTheServerReports()
+    {
+        // Arrange: Content-Disposition describes the bytes actually being sent, so it outranks
+        // anything stored on the document record.
+        var tempDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadResponse(
+            $"{_factory.Options.BaseUrl}/api/documents/1/download/",
+            FakePdfBytes,
+            dispositionFileName: "scan-2026.pdf");
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            json.RootElement.GetProperty("result").GetProperty("filename").GetString()
+                .Should().Be("scan-2026_1.pdf");
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_ForTwoDocumentsWithTheSameFileName_KeepsBothFiles()
+    {
+        // Arrange: both documents carry the same file name, which used to mean the second export
+        // silently replaced the first and the first result then pointed at the wrong document.
+        var tempDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        var second = "%PDF-1.4 second body"u8.ToArray();
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "First"));
+        _factory.SetupGet("api/documents/2/", TestFixtures.Documents.CreateDocumentJson(2, "Second"));
+        SetupDownloadBytes(1, FakePdfBytes);
+        SetupDownloadBytes(2, second);
+
+        try
+        {
+            // Act
+            var firstResult = await DocumentTools.ExportToOutbox(_factory.Client, 1);
+            var secondResult = await DocumentTools.ExportToOutbox(_factory.Client, 2);
+
+            // Assert
+            var firstPath = JsonDocument.Parse(firstResult).RootElement
+                .GetProperty("result").GetProperty("path").GetString()!;
+            var secondPath = JsonDocument.Parse(secondResult).RootElement
+                .GetProperty("result").GetProperty("path").GetString()!;
+
+            secondPath.Should().NotBe(firstPath);
+            (await File.ReadAllBytesAsync(firstPath)).Should().Equal(FakePdfBytes,
+                "the first export must survive the second");
+            (await File.ReadAllBytesAsync(secondPath)).Should().Equal(second);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_WhenDestinationIsASymlink_ReplacesTheLinkInsteadOfWritingThroughIt()
+    {
+        // Arrange: the outbox is a shared volume, so another writer can plant a symlink at the
+        // path we are about to write. Writing through it would let them pick a file for this
+        // process (running as root by default) to truncate.
+        var tempDir = NewOutboxDir();
+        var outsideDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        Directory.CreateDirectory(tempDir);
+        Directory.CreateDirectory(outsideDir);
+        var victim = Path.Combine(outsideDir, "victim.txt");
+        await File.WriteAllTextAsync(victim, "do not touch");
+        var destination = Path.Combine(tempDir, "test_document_archived_1.pdf");
+        File.CreateSymbolicLink(destination, victim);
+
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        try
+        {
+            // Act
+            var result = await DocumentTools.ExportToOutbox(_factory.Client, 1);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            (await File.ReadAllTextAsync(victim)).Should().Be("do not touch",
+                "the export must not be written through the symlink");
+            new FileInfo(destination).LinkTarget.Should().BeNull("the link itself must be replaced");
+            (await File.ReadAllBytesAsync(destination)).Should().Equal(FakePdfBytes);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+            if (Directory.Exists(outsideDir)) Directory.Delete(outsideDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExportToOutbox_LeavesNoPartialFileBehind_WhenTheDownloadSucceeds()
+    {
+        // Arrange: the write goes through a temporary file, which must not be left in the outbox
+        // for the other side of the volume to find.
+        var tempDir = NewOutboxDir();
+        _factory.Options.OutboxDirectory = tempDir;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        try
+        {
+            // Act
+            await DocumentTools.ExportToOutbox(_factory.Client, 1);
+
+            // Assert
+            Directory.GetFiles(tempDir).Should().HaveCount(1);
+            Directory.GetFiles(tempDir, "*.part").Should().BeEmpty();
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Download_WithReturnBase64_WhenTooLarge_StopsReadingAtTheCap()
+    {
+        // Arrange: a body that throws once read past the cap. Rejecting an over-large file must
+        // not require buffering it first, which is what made this an OOM risk.
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        _factory.MockHandler
+            .When(HttpMethod.Get, $"{_factory.Options.BaseUrl}/api/documents/1/download/")
+            .Respond(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new ThrowPastLimitStream(MaxInlineBase64BytesForTests + 1))
+            });
+
+        // Act
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION",
+            "one byte past the cap is all it takes to know the file is too large");
+    }
+
+    [Fact]
+    public async Task Download_WithReturnBase64_WhenTheBodyStalls_FailsInsteadOfPinningTheRequest()
+    {
+        // Arrange: HttpClient.Timeout stops applying once the response headers are in, so a body
+        // that goes quiet would hold this request open for as long as the connection lasts.
+        _factory.HttpClient.Timeout = TimeSpan.FromMilliseconds(250);
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        _factory.MockHandler
+            .When(HttpMethod.Get, $"{_factory.Options.BaseUrl}/api/documents/1/download/")
+            .Respond(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new StallingStream())
+            });
+
+        // Act
+        var download = DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+        var finished = await Task.WhenAny(download, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        // Assert
+        finished.Should().BeSameAs(download, "a stalled body read must be abandoned, not awaited forever");
+        var json = JsonDocument.Parse(await download);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("UPSTREAM_ERROR");
+    }
+
+
+    [Fact]
+    public async Task Download_WithReturnBase64_WhenTooLargeAndSizeUnknown_StillReturnsValidationError()
+    {
+        // Arrange: no Content-Length, so the cap cannot be enforced from the header. The read
+        // itself must be bounded instead.
+        var bigBytes = new byte[13 * 1024];
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadResponse(
+            $"{_factory.Options.BaseUrl}/api/documents/1/download/",
+            bigBytes,
+            sendContentLength: false);
+
+        // Act
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+    }
+
+
+    [Fact]
+    public async Task Download_WithReturnBase64_WhenSmall_ReturnsContent()
+    {
+        // Arrange
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        // Act
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        var res = json.RootElement.GetProperty("result");
+        res.GetProperty("mime_type").GetString().Should().Be("application/pdf");
+        res.GetProperty("size_bytes").GetInt32().Should().Be(FakePdfBytes.Length);
+        Convert.FromBase64String(res.GetProperty("content_base64").GetString()!).Should().Equal(FakePdfBytes);
+    }
+
+    [Fact]
+    public async Task Download_WithReturnBase64_WhenTooLarge_ReturnsValidationError()
+    {
+        // Arrange
+        var bigBytes = new byte[13 * 1024];
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, bigBytes);
+
+        // Act
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
     }
 
     #endregion
@@ -903,4 +1351,500 @@ public class DocumentToolsTests : IDisposable
     }
 
     #endregion
+
+    #region Title Length Validation Tests
+
+    // Paperless-ngx stores at most 127 characters of a document title: the model says
+    // max_length=128, but the consumer does Document.objects.create(title=title[:127]),
+    // and the upload serializer runs no length validation at all. A longer title is
+    // therefore truncated silently while the API reports success. These tests pin the
+    // boundary at 127 across all three write paths.
+
+    private const int TitleLimit = 127;
+    private static string TitleOfLength(int length) => new('A', length);
+
+    [Fact]
+    public async Task Upload_WithTitleAtLimit_Succeeds()
+    {
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+
+        // Act
+        var result = await DocumentTools.Upload(
+            _factory.Client,
+            fileContent,
+            "test.pdf",
+            title: TitleOfLength(TitleLimit));
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("warnings").GetArrayLength().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Upload_WithTitleOverLimit_ReturnsValidationErrorAndSendsNothing()
+    {
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        var upload = _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+
+        // Act
+        var result = await DocumentTools.Upload(
+            _factory.Client,
+            fileContent,
+            "test.pdf",
+            title: TitleOfLength(TitleLimit + 1));
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(upload).Should().Be(0, "nothing may reach Paperless when the title is rejected");
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithTitleAtLimit_Succeeds()
+    {
+        // Arrange
+        var tempFile = Path.GetTempFileName();
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+            _factory.MockHandler
+                .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+                .Respond("application/json", "\"task-uuid-12345\"");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(
+                _factory.Client,
+                tempFile,
+                title: TitleOfLength(TitleLimit));
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+            json.RootElement.GetProperty("warnings").GetArrayLength().Should().Be(0);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithTitleOverLimit_ReturnsValidationErrorAndSendsNothing()
+    {
+        // Arrange
+        var tempFile = Path.GetTempFileName();
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+            var upload = _factory.MockHandler
+                .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+                .Respond("application/json", "\"task-uuid-12345\"");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(
+                _factory.Client,
+                tempFile,
+                title: TitleOfLength(TitleLimit + 1));
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+            json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+            _factory.MockHandler.GetMatchCount(upload).Should().Be(0, "nothing may reach Paperless when the title is rejected");
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithDerivedTitleOverLimit_ReturnsValidationError()
+    {
+        // A title derived from an over-long file name is just as vulnerable to silent
+        // truncation as one passed explicitly, so it must be rejected too.
+        // Arrange
+        var longName = TitleOfLength(TitleLimit + 1) + ".pdf";
+        var tempFile = Path.Combine(Path.GetTempPath(), longName);
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(_factory.Client, tempFile);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+            json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task Update_WithTitleAtLimit_Succeeds()
+    {
+        // Arrange
+        var title = TitleOfLength(TitleLimit);
+        _factory.SetupPatch("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, title));
+
+        // Act
+        var result = await DocumentTools.Update(_factory.Client, 1, title: title);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("result").GetProperty("title").GetString().Should().Be(title);
+    }
+
+    [Fact]
+    public async Task Update_WithTitleOverLimit_ReturnsValidationErrorAndSendsNothing()
+    {
+        // Arrange
+        var patch = _factory.SetupPatch("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "unused"));
+
+        // Act
+        var result = await DocumentTools.Update(_factory.Client, 1, title: TitleOfLength(TitleLimit + 1));
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(patch).Should().Be(0, "the document must be left untouched when the title is rejected");
+    }
+
+    [Fact]
+    public async Task Update_WithTitleOverLimit_ErrorMessageNamesLimitAndActualLength()
+    {
+        // Act
+        var result = await DocumentTools.Update(_factory.Client, 1, title: TitleOfLength(140));
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        var message = json.RootElement.GetProperty("error").GetProperty("message").GetString();
+        message.Should().Contain("140", "the caller needs to know how long their title actually was");
+        message.Should().Contain("127", "the caller needs to know the limit");
+    }
+
+    [Fact]
+    public async Task Update_WithNullTitle_IsNotRejected()
+    {
+        // A null title means "leave it alone" and must not trip the length check.
+        // Arrange
+        _factory.SetupPatch("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Untouched"));
+
+        // Act
+        var result = await DocumentTools.Update(_factory.Client, 1, correspondent: 5);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+    }
+
+    // --- Effective-title validation: null/empty titles fall back to the filename stem
+    // (PaperlessClient omits null/empty titles from the request, so Paperless derives
+    // the title from the file name server-side and truncates it just the same). ---
+
+    [Fact]
+    public async Task Upload_WithNullTitleAndShortFileName_Succeeds()
+    {
+        // Regression guard for the base64-null path: no title plus a short filename
+        // must keep working exactly as before.
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, "test.pdf");
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("warnings").GetArrayLength().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Upload_WithNullTitleAndOverlongFileNameStem_ReturnsValidationError()
+    {
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        var upload = _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+        var fileName = TitleOfLength(TitleLimit + 1) + ".pdf";
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, fileName);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(upload).Should().Be(0, "nothing may reach Paperless when the derived title is rejected");
+    }
+
+    [Fact]
+    public async Task Upload_WithEmptyTitleAndOverlongFileNameStem_ReturnsValidationError()
+    {
+        // An empty title is omitted by PaperlessClient exactly like null, so it must
+        // get the same filename fallback and the same rejection.
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        var fileName = TitleOfLength(TitleLimit + 1) + ".pdf";
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, fileName, title: "");
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithEmptyTitleAndOverlongFileNameStem_ReturnsValidationError()
+    {
+        // Arrange
+        var longName = TitleOfLength(TitleLimit + 1) + ".pdf";
+        var tempFile = Path.Combine(Path.GetTempPath(), longName);
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(_factory.Client, tempFile, title: "");
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+            json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task Upload_WithAstralTitleOf64CodePoints_Succeeds()
+    {
+        // End-to-end guard for code-point counting: 64 astral emoji are 128 UTF-16
+        // units but only 64 code points; Paperless stores them intact, so the tool
+        // must accept them.
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+        var title = string.Concat(Enumerable.Repeat("\U0001F600", 64));
+        title.Length.Should().Be(128, "precondition: astral emoji take two UTF-16 units each");
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, "test.pdf", title: title);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("warnings").GetArrayLength().Should().Be(0);
+    }
+
+
+    // --- Long-dotfile regression: Path.GetFileNameWithoutExtension(".<128 chars>") is
+    // empty, so the effective-title guard used to see an empty title and let the upload
+    // through, while Paperless kept the whole dotfile name as the stem and truncated it
+    // to 127. Both upload paths must reject it. ---
+
+    [Fact]
+    public async Task Upload_WithNullTitleAndOverlongDotfileName_ReturnsValidationError()
+    {
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        var upload = _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+        var fileName = "." + TitleOfLength(TitleLimit + 1);
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, fileName);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(upload).Should().Be(0, "nothing may reach Paperless when the derived title is rejected");
+    }
+
+    [Fact]
+    public async Task Upload_WithNullTitleAndOverlongNameEndingInDot_ReturnsValidationError()
+    {
+        // 127 characters plus a trailing dot: .NET reports a safe 127-character stem,
+        // but pathlib keeps the dot and Paperless stores 128 -> silent truncation.
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        var upload = _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+        var fileName = TitleOfLength(TitleLimit) + ".";
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, fileName);
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+        json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(upload).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Upload_WithNullTitleAndShortDotfileName_Succeeds()
+    {
+        // The guard must not overreach: an ordinary dotfile is a perfectly good title.
+        // Arrange
+        var fileContent = Convert.ToBase64String("Test file content"u8.ToArray());
+        _factory.MockHandler
+            .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+            .Respond("application/json", "\"task-uuid-12345\"");
+
+        // Act
+        var result = await DocumentTools.Upload(_factory.Client, fileContent, ".bashrc");
+
+        // Assert
+        var json = JsonDocument.Parse(result);
+        json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        json.RootElement.GetProperty("warnings").GetArrayLength().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithNullTitleAndOverlongDotfileName_ReturnsValidationError()
+    {
+        // Arrange
+        var longDotfile = "." + TitleOfLength(TitleLimit + 1);
+        var tempFile = Path.Combine(Path.GetTempPath(), longDotfile);
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+            var upload = _factory.MockHandler
+                .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+                .Respond("application/json", "\"task-uuid-12345\"");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(_factory.Client, tempFile);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeFalse();
+            json.RootElement.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+            _factory.MockHandler.GetMatchCount(upload).Should().Be(0, "nothing may reach Paperless when the derived title is rejected");
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    [Fact]
+    public async Task UploadFromPath_WithNullTitleAndShortDotfileName_Succeeds()
+    {
+        // Arrange
+        var tempFile = Path.Combine(Path.GetTempPath(), ".paperlessmcp-dotfile-probe");
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, "Test file content for upload");
+            _factory.MockHandler
+                .When(HttpMethod.Post, "https://paperless.example.com/api/documents/post_document/")
+                .Respond("application/json", "\"task-uuid-12345\"");
+
+            // Act
+            var result = await DocumentTools.UploadFromPath(_factory.Client, tempFile);
+
+            // Assert
+            var json = JsonDocument.Parse(result);
+            json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        }
+        finally
+        {
+            if (File.Exists(tempFile)) File.Delete(tempFile);
+        }
+    }
+
+    #endregion
+    /// <summary>Mirrors DocumentTools.MaxInlineBase64Bytes, which is private.</summary>
+    private const int MaxInlineBase64BytesForTests = 12 * 1024;
+
+    private abstract class TestBodyStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>A response body that throws once more than <paramref name="allowed"/> bytes are read.</summary>
+    private sealed class ThrowPastLimitStream(int allowed) : TestBodyStream
+    {
+        private int _served;
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var chunk = Math.Min(buffer.Length, 4096);
+            if (chunk == 0)
+            {
+                return ValueTask.FromResult(0);
+            }
+
+            _served += chunk;
+            if (_served > allowed)
+            {
+                throw new IOException($"body read past {allowed} bytes");
+            }
+
+            buffer.Span[..chunk].Fill(0x25);
+            return ValueTask.FromResult(chunk);
+        }
+    }
+
+    /// <summary>A response body that sends one byte and then goes quiet forever.</summary>
+    private sealed class StallingStream : TestBodyStream
+    {
+        private bool _sentFirstByte;
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!_sentFirstByte && buffer.Length > 0)
+            {
+                _sentFirstByte = true;
+                buffer.Span[0] = 0x25;
+                return 1;
+            }
+
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+    }
+
 }

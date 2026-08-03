@@ -120,6 +120,11 @@ void ConfigureServices(IServiceCollection services, IConfiguration configuration
             maxDownloadSize <= PaperlessOptions.MaximumDownloadSizeBytes
                 ? maxDownloadSize
                 : PaperlessOptions.DefaultMaxDownloadSizeBytes;
+
+        options.OutboxDirectory = Environment.GetEnvironmentVariable("PAPERLESS_OUTBOX_DIR")
+                                  ?? Environment.GetEnvironmentVariable("OUTBOX_DIR")
+                                  ?? configuration.GetValue<string>("Paperless:OutboxDirectory")
+                                  ?? PaperlessOptions.DefaultOutboxDirectory;
     });
 
     // Configure retry policy for transient errors

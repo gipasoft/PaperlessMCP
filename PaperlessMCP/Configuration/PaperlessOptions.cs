@@ -10,6 +10,11 @@ public class PaperlessOptions
     public const long MaximumDownloadSizeBytes = 100 * 1024 * 1024;
 
     /// <summary>
+    /// Default directory that <c>paperless_documents_export_to_outbox</c> writes to.
+    /// </summary>
+    public const string DefaultOutboxDirectory = "/home/mcp/outbox";
+
+    /// <summary>
     /// Base URL of the Paperless-ngx instance (e.g., https://docs.example.com).
     /// </summary>
     public string BaseUrl { get; set; } = string.Empty;
@@ -34,4 +39,11 @@ public class PaperlessOptions
     /// Maximum binary document size returned by content tools.
     /// </summary>
     public long MaxDownloadSizeBytes { get; set; } = DefaultMaxDownloadSizeBytes;
+
+    /// <summary>
+    /// Filesystem directory that <c>paperless_documents_export_to_outbox</c> writes exported
+    /// files into. Intended to be a directory shared (bind-mounted) with other MCP servers so
+    /// they can attach the file by path without the bytes passing through the model context.
+    /// </summary>
+    public string OutboxDirectory { get; set; } = DefaultOutboxDirectory;
 }
