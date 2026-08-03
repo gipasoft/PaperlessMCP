@@ -404,9 +404,10 @@ the 10 MiB default.
 From the repository root:
 
 ```bash
+VERSION=$(jq -er '.version' version.json)
 docker build \
-  --build-arg VERSION=0.3.2-content \
-  -t paperlessmcp-content:0.3.2-content \
+  --build-arg VERSION="$VERSION" \
+  -t "paperlessmcp-content:$VERSION" \
   -f PaperlessMCP/Dockerfile \
   PaperlessMCP
 ```
@@ -414,8 +415,8 @@ docker build \
 To publish it to a registry reachable by QNAP:
 
 ```bash
-docker tag paperlessmcp-content:0.3.2-content registry.example/paperlessmcp-content:0.3.2-content
-docker push registry.example/paperlessmcp-content:0.3.2-content
+docker tag "paperlessmcp-content:$VERSION" "registry.example/paperlessmcp-content:$VERSION"
+docker push "registry.example/paperlessmcp-content:$VERSION"
 ```
 
 ### Fork image on GHCR

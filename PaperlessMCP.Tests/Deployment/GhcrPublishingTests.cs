@@ -41,6 +41,24 @@ public class GhcrPublishingTests
     }
 
     [Fact]
+    public void Workflow_DerivesDockerBuildVersionFromVersionJson()
+    {
+        var workflowPath = Path.Combine(
+            RepositoryRoot, ".github", "workflows", "docker-publish.yml");
+        var workflow = File.ReadAllText(workflowPath);
+
+        Assert.Contains("name: Read application version", workflow);
+        Assert.Contains("id: app-version", workflow);
+        Assert.Contains(
+            "jq -er '.version | select(type == \"string\" and length > 0)' version.json",
+            workflow);
+        Assert.Contains(
+            "build-args: VERSION=${{ steps.app-version.outputs.value }}",
+            workflow);
+        Assert.DoesNotContain("build-args: VERSION=0.3.2-content", workflow);
+    }
+
+    [Fact]
     public void Compose_UsesPullOnlyGhcrImageAndKeepsRollbackOverride()
     {
         var composePath = Path.Combine(
