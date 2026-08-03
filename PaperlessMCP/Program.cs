@@ -39,12 +39,7 @@ else
 
     builder.Services
         .AddMcpServer()
-        .WithHttpTransport(options =>
-        {
-            // Disable idle timeout completely - sessions should never be killed due to inactivity
-            // The SDK's IdleTrackingBackgroundService respects InfiniteTimeSpan to skip idle-based pruning
-            options.IdleTimeout = Timeout.InfiniteTimeSpan;
-        })
+        .WithHttpTransport(McpHttpTransportConfiguration.Configure)
         .WithToolsFromAssembly();
 
     var app = builder.Build();
