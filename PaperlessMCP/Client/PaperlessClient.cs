@@ -64,6 +64,11 @@ public class PaperlessClient
     public string BaseUrl => _options.BaseUrl;
 
     /// <summary>
+    /// Directory that <c>paperless_documents_export_to_outbox</c> writes exported files to.
+    /// </summary>
+    public string OutboxDirectory => _options.OutboxDirectory;
+
+    /// <summary>
     /// Normalizes a requested page size to the configured positive upper bound.
     /// </summary>
     public int GetEffectivePageSize(int? requestedPageSize = null)
@@ -153,6 +158,7 @@ public class PaperlessClient
         int page = 1,
         int? pageSize = null,
         string? ordering = null,
+        string? customFieldQuery = null,
         CancellationToken cancellationToken = default)
     {
         var result = await SearchDocumentsWithResultAsync(
@@ -170,6 +176,7 @@ public class PaperlessClient
             page,
             pageSize,
             ordering,
+            customFieldQuery,
             cancellationToken).ConfigureAwait(false);
 
         return result.IsSuccess && result.Value != null
@@ -192,6 +199,7 @@ public class PaperlessClient
         int page = 1,
         int? pageSize = null,
         string? ordering = null,
+        string? customFieldQuery = null,
         CancellationToken cancellationToken = default)
     {
         var queryParams = HttpUtility.ParseQueryString(string.Empty);
@@ -230,6 +238,10 @@ public class PaperlessClient
 
         if (archiveSerialNumber.HasValue)
             queryParams["archive_serial_number"] = archiveSerialNumber.Value.ToString();
+
+        // Paperless-ngx owns the custom_field_query grammar and validates it, so pass it through verbatim.
+        if (!string.IsNullOrWhiteSpace(customFieldQuery))
+            queryParams["custom_field_query"] = customFieldQuery;
 
         queryParams["page"] = page.ToString();
         queryParams["page_size"] = GetEffectivePageSize(pageSize).ToString();
@@ -622,6 +634,56 @@ public class PaperlessClient
             PreviewUrl = $"{baseUrl}/api/documents/{id}/preview/",
             ThumbnailUrl = $"{baseUrl}/api/documents/{id}/thumb/"
         };
+    }
+
+    /// <summary>
+    /// Opens a document's binary file server-side for streaming, together with the response
+    /// content type and the file name Paperless reports, so callers can persist or forward the
+    /// file without the bytes crossing the model context.
+    /// </summary>
+    /// <remarks>
+    /// The body is deliberately left unread: the caller decides whether to stream it to disk or
+    /// to take a bounded prefix, so a large document never has to be buffered whole. The returned
+    /// <see cref="DocumentFileResponse"/> owns the response and must be disposed.
+    /// </remarks>
+    /// <param name="id">Document ID.</param>
+    /// <param name="original">
+    /// When true, request the original uploaded file; otherwise the archived version
+    /// (typically an OCR'd PDF) is returned when one exists.
+    /// </param>
+    public async Task<(DocumentFileResponse? File, string? Error)> OpenDocumentFileAsync(
+        int id,
+        bool original = false,
+        CancellationToken cancellationToken = default)
+    {
+        var url = $"api/documents/{id}/download/{(original ? "?original=true" : string.Empty)}";
+        HttpResponseMessage? response = null;
+        try
+        {
+            response = await _httpClient
+                .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var status = (int)response.StatusCode;
+                response.Dispose();
+                return (null, $"HTTP {status} downloading document {id}");
+            }
+
+            var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+
+            // The stall timeout mirrors HttpClient.Timeout, which stops applying once the
+            // response headers are in: without it a stalled body read would pin this request
+            // for as long as the connection stays open.
+            return (new DocumentFileResponse(response, stream, _httpClient.Timeout), null);
+        }
+        catch (Exception ex)
+        {
+            response?.Dispose();
+            _logger.LogError(ex, "Failed to download file for document {DocumentId}", id);
+            return (null, ex.Message);
+        }
     }
 
     /// <summary>
