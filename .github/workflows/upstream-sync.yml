@@ -46,16 +46,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          target="automation/sync-upstream-$(git rev-parse --short=7 upstream/main)"
+
           existing="$(gh pr list --state open --base main --json headRefName \
             --jq '[.[] | select(.headRefName | startswith("automation/sync-upstream-"))][0].headRefName // ""')"
+
           if [[ -n "$existing" ]]; then
             git fetch origin "$existing"
             git checkout -B "$existing" "origin/$existing"
             branch="$existing"
+
+          elif git ls-remote --exit-code --heads origin "$target" >/dev/null 2>&1; then
+            git fetch origin "$target"
+            git checkout -B "$target" "origin/$target"
+            branch="$target"
+
           else
-            branch="automation/sync-upstream-$(git rev-parse --short=7 upstream/main)"
+            branch="$target"
             git checkout -b "$branch" origin/main
           fi
+
           echo "name=$branch" >> "$GITHUB_OUTPUT"
       - name: Merge fork main and upstream
         if: steps.updates.outputs.available == 'true'
