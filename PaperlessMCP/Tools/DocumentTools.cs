@@ -125,19 +125,12 @@ public static class DocumentTools
         return JsonSerializer.Serialize(response);
     }
 
-    /// <summary>
-    /// Upper bound on the raw file size returnable inline as base64. base64 inflates by ~4/3
-    /// and the whole tool response must fit the model's tool-output budget, so this is kept
-    /// deliberately small: anything larger must go through paperless_documents_export_to_outbox.
-    /// </summary>
-    private const int MaxInlineBase64Bytes = 12 * 1024;
-
     [McpServerTool(Name = "paperless_documents_download")]
     [Description("Get download URLs for a document's original file, preview, and thumbnail. Set returnBase64=true to also inline the file bytes as base64, but only for tiny files: use paperless_documents_export_to_outbox for anything real.")]
     public static async Task<string> Download(
         PaperlessClient client,
         [Description("Document ID")] int id,
-        [Description("Also return the file content as base64 (only allowed for tiny files, ~12 KB). Use paperless_documents_export_to_outbox otherwise.")] bool returnBase64 = false)
+        [Description("Also return the file content as base64. Allowed only for small files (default limit ~12 KB, configurable via MAX_INLINE_BASE64_BYTES). Use paperless_documents_export_to_outbox otherwise.")] bool returnBase64 = false)
     {
         var document = await client.GetDocumentAsync(id).ConfigureAwait(false);
 
@@ -162,6 +155,8 @@ public static class DocumentTools
             return JsonSerializer.Serialize(response);
         }
 
+        var maxInlineBytes = client.MaxInlineBase64Bytes;
+
         var (file, error) = await client.OpenDocumentFileAsync(id).ConfigureAwait(false);
         if (error != null || file == null)
         {
@@ -181,7 +176,7 @@ public static class DocumentTools
             bool exceeded;
             try
             {
-                (content, exceeded) = await file.ReadAtMostAsync(MaxInlineBase64Bytes).ConfigureAwait(false);
+                (content, exceeded) = await file.ReadAtMostAsync(maxInlineBytes).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -198,10 +193,10 @@ public static class DocumentTools
             {
                 var size = file.ContentLength is { } length
                     ? $"{length} bytes"
-                    : $"larger than {MaxInlineBase64Bytes} bytes";
+                    : $"larger than {maxInlineBytes} bytes";
                 var errorResponse = McpErrorResponse.Create(
                     ErrorCodes.Validation,
-                    $"File is {size}; too large to inline as base64 (limit {MaxInlineBase64Bytes}). Use paperless_documents_export_to_outbox instead.",
+                    $"File is {size}; too large to inline as base64 (limit {maxInlineBytes}). Use paperless_documents_export_to_outbox instead.",
                     meta: new McpMeta { PaperlessBaseUrl = client.BaseUrl }
                 );
                 return JsonSerializer.Serialize(errorResponse);
@@ -694,7 +689,7 @@ public static class DocumentTools
         [Description("Correspondent ID (optional, use -1 to clear)")] int? correspondent = null,
         [Description("Document type ID (optional, use -1 to clear)")] int? documentType = null,
         [Description("Storage path ID (optional, use -1 to clear)")] int? storagePath = null,
-        [Description("Tag IDs to set (comma-separated, optional)")] string? tags = null,
+        [Description("Tag IDs to set as an integer array or comma-separated string (optional; [] clears tags)")] JsonElement? tags = null,
         [Description("Archive serial number (optional)")] int? archiveSerialNumber = null,
         [Description("Created date (YYYY-MM-DD, optional)")] string? created = null,
         [Description("Include the document's full OCR content in the response (default: false). Leave false for metadata-only updates to save tokens.")] bool includeContent = false)
@@ -712,13 +707,41 @@ public static class DocumentTools
             return JsonSerializer.Serialize(errorResponse);
         }
 
+        List<int>? parsedTags = null;
+        if (tags is { ValueKind: not JsonValueKind.Null } tagValue)
+        {
+            if (tagValue.ValueKind == JsonValueKind.Array)
+            {
+                try { parsedTags = tagValue.Deserialize<List<int>>(); }
+                catch (JsonException) { }
+            }
+            else if (tagValue.ValueKind == JsonValueKind.String)
+            {
+                var tagString = tagValue.GetString()!;
+                var parsed = ParseIntArray(tagString);
+                if (parsed is not null && parsed.Length == tagString.Split(',').Length)
+                    parsedTags = parsed.ToList();
+            }
+
+            if (parsedTags is null && !(tagValue.ValueKind == JsonValueKind.String &&
+                string.IsNullOrWhiteSpace(tagValue.GetString())))
+            {
+                var errorResponse = McpErrorResponse.Create(
+                    ErrorCodes.Validation,
+                    "tags must be an array of integer IDs or a comma-separated list of integer IDs",
+                    meta: new McpMeta { PaperlessBaseUrl = client.BaseUrl }
+                );
+                return JsonSerializer.Serialize(errorResponse);
+            }
+        }
+
         var request = new DocumentUpdateRequest
         {
             Title = title,
             Correspondent = correspondent == -1 ? null : correspondent,
             DocumentType = documentType == -1 ? null : documentType,
             StoragePath = storagePath == -1 ? null : storagePath,
-            Tags = ParseIntArray(tags)?.ToList(),
+            Tags = parsedTags,
             ArchiveSerialNumber = archiveSerialNumber,
             Created = ParseDate(created)
         };
