@@ -923,6 +923,36 @@ public class DocumentToolsTests : IDisposable
         Convert.FromBase64String(res.GetProperty("content_base64").GetString()!).Should().Equal(FakePdfBytes);
     }
 
+    [Theory]
+    [InlineData(20 * 1024, true)]
+    [InlineData(0, false)]
+    [InlineData(-1, false)]
+    public async Task Download_WithReturnBase64_UsesConfiguredLimit(int configuredLimit, bool expectedSuccess)
+    {
+        _factory.Options.MaxInlineBase64Bytes = configuredLimit;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, new byte[13 * 1024]);
+
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        var response = JsonDocument.Parse(result).RootElement;
+        response.GetProperty("ok").GetBoolean().Should().Be(expectedSuccess);
+        if (!expectedSuccess)
+            response.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+    }
+
+    [Fact]
+    public async Task Download_WithReturnBase64_MaxIntLimit_DoesNotOverflow()
+    {
+        _factory.Options.MaxInlineBase64Bytes = int.MaxValue;
+        _factory.SetupGet("api/documents/1/", TestFixtures.Documents.CreateDocumentJson(1, "Test Doc"));
+        SetupDownloadBytes(1, FakePdfBytes);
+
+        var result = await DocumentTools.Download(_factory.Client, 1, returnBase64: true);
+
+        JsonDocument.Parse(result).RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+    }
+
     [Fact]
     public async Task Download_WithReturnBase64_WhenTooLarge_ReturnsValidationError()
     {
@@ -1073,6 +1103,73 @@ public class DocumentToolsTests : IDisposable
         var json = JsonDocument.Parse(result);
         json.RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
         json.RootElement.GetProperty("result").GetProperty("title").GetString().Should().Be("Updated Title");
+    }
+
+    [Theory]
+    [InlineData("[19]", new[] { 19 })]
+    [InlineData("\"19,20\"", new[] { 19, 20 })]
+    [InlineData("[]", new int[0])]
+    public async Task Update_WithTags_SendsAndReturnsRequestedTagIds(string tagsJson, int[] expectedTags)
+    {
+        string? requestBody = null;
+        _factory.MockHandler
+            .When(HttpMethod.Patch, "https://paperless.example.com/api/documents/1/")
+            .With(request =>
+            {
+                requestBody = request.Content?.ReadAsStringAsync().GetAwaiter().GetResult();
+                return true;
+            })
+            .Respond("application/json", JsonSerializer.Serialize(
+                TestFixtures.Documents.CreateDocument() with { Tags = expectedTags.ToList() }));
+
+        var tags = JsonDocument.Parse(tagsJson).RootElement.Clone();
+        var result = await DocumentTools.Update(_factory.Client, 1, tags: tags);
+
+        requestBody.Should().NotBeNull();
+        JsonDocument.Parse(requestBody!).RootElement.GetProperty("tags").EnumerateArray()
+            .Select(tag => tag.GetInt32()).Should().Equal(expectedTags);
+        var response = JsonDocument.Parse(result).RootElement;
+        response.GetProperty("ok").GetBoolean().Should().BeTrue();
+        response.GetProperty("result").GetProperty("tags").EnumerateArray()
+            .Select(tag => tag.GetInt32()).Should().Equal(expectedTags);
+    }
+
+    [Theory]
+    [InlineData("\"[19]\"")]
+    [InlineData("\"19,bad\"")]
+    [InlineData("[\"19\"]")]
+    public async Task Update_WithInvalidTags_ReturnsValidationErrorWithoutPatching(string tagsJson)
+    {
+        var patch = _factory.MockHandler.When(HttpMethod.Patch, "https://paperless.example.com/api/documents/1/")
+            .Respond("application/json", "{}");
+        var tags = JsonDocument.Parse(tagsJson).RootElement.Clone();
+
+        var result = await DocumentTools.Update(_factory.Client, 1, tags: tags);
+
+        var response = JsonDocument.Parse(result).RootElement;
+        response.GetProperty("ok").GetBoolean().Should().BeFalse();
+        response.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        _factory.MockHandler.GetMatchCount(patch).Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Update_WithEmptyTagString_OmitsTagsFromPatch()
+    {
+        string? requestBody = null;
+        _factory.MockHandler
+            .When(HttpMethod.Patch, "https://paperless.example.com/api/documents/1/")
+            .With(request =>
+            {
+                requestBody = request.Content?.ReadAsStringAsync().GetAwaiter().GetResult();
+                return true;
+            })
+            .Respond("application/json", TestFixtures.Documents.CreateDocumentJson());
+
+        var tags = JsonDocument.Parse("\"\"").RootElement.Clone();
+        var result = await DocumentTools.Update(_factory.Client, 1, tags: tags);
+
+        JsonDocument.Parse(result).RootElement.GetProperty("ok").GetBoolean().Should().BeTrue();
+        JsonDocument.Parse(requestBody!).RootElement.TryGetProperty("tags", out _).Should().BeFalse();
     }
 
     [Fact]
@@ -1783,7 +1880,6 @@ public class DocumentToolsTests : IDisposable
     }
 
     #endregion
-    /// <summary>Mirrors DocumentTools.MaxInlineBase64Bytes, which is private.</summary>
     private const int MaxInlineBase64BytesForTests = 12 * 1024;
 
     private abstract class TestBodyStream : Stream

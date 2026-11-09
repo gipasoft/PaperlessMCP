@@ -14,7 +14,15 @@ var useStdio = args.Contains("--stdio");
 if (useStdio)
 {
     // stdio transport for local usage (Claude Desktop)
-    var builder = Host.CreateApplicationBuilder(args);
+    //
+    // Pin the content root to the install directory. Claude Desktop starts MCP servers
+    // with cwd "/", and the host's default appsettings reload watcher would otherwise
+    // watch the whole filesystem, holding memory for every file event on the machine.
+    var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+    {
+        Args = args,
+        ContentRootPath = AppContext.BaseDirectory,
+    });
 
     ConfigureServices(builder.Services, builder.Configuration);
 
@@ -26,7 +34,10 @@ if (useStdio)
     builder.Services
         .AddMcpServer()
         .WithStdioServerTransport()
-        .WithToolsFromAssembly();
+        .WithToolsFromAssembly()
+        .WithRequestFilters(filters => filters.AddListToolsFilter(
+            next => async (context, cancellationToken) =>
+                NullableSchemaCompatibility.Apply(await next(context, cancellationToken).ConfigureAwait(false))));
 
     await builder.Build().RunAsync();
 }
@@ -40,7 +51,10 @@ else
     builder.Services
         .AddMcpServer()
         .WithHttpTransport(McpHttpTransportConfiguration.Configure)
-        .WithToolsFromAssembly();
+        .WithToolsFromAssembly()
+        .WithRequestFilters(filters => filters.AddListToolsFilter(
+            next => async (context, cancellationToken) =>
+                NullableSchemaCompatibility.Apply(await next(context, cancellationToken).ConfigureAwait(false))));
 
     var app = builder.Build();
 
@@ -120,6 +134,11 @@ void ConfigureServices(IServiceCollection services, IConfiguration configuration
                                   ?? Environment.GetEnvironmentVariable("OUTBOX_DIR")
                                   ?? configuration.GetValue<string>("Paperless:OutboxDirectory")
                                   ?? PaperlessOptions.DefaultOutboxDirectory;
+
+        options.MaxInlineBase64Bytes = ParsingHelpers.ParsePositiveInt(
+            Environment.GetEnvironmentVariable("MAX_INLINE_BASE64_BYTES"),
+            configuration.GetValue<int?>("Paperless:MaxInlineBase64Bytes")
+                ?? PaperlessOptions.DefaultMaxInlineBase64Bytes);
     });
 
     // Configure retry policy for transient errors
